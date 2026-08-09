@@ -1,248 +1,407 @@
-# Agent build spec: ChatGPT Web Adapter
+# Agent contract: ChatGPT Web Adapter
 
-This is a **build-from-scratch spec** for AI coding agents. Read it fully,
-then implement. Goal: an OpenAI-compatible API (`/v1/chat/completions`) that
-answers from a real chatgpt.com web session via Playwright browser
-automation, consuming the account's general web chat quota (not API quota).
+**Audience:** AI coding agents working in this repo.  
+**The implementation already exists.** Do not recreate the files below from
+scratch unless a path is missing or the user explicitly asks for a rewrite.
 
-Reference: the original was built at `/home/ubuntu/chatgpt-adapter` and is
-running (gateway:18110, adapter:18111). You are reproducing it, not
-modifying it. Target environment: Ubuntu 22.04+, Python 3.10-3.12, arm64
-or x64. If any selector or timing differs in the live SPA, adapt using the
-SAME behavioral contract (below) and log what you changed.
+**Use this doc to:**
+1. Understand the behavioral contract the code must keep.
+2. Verify, debug, or adapt when the chatgpt.com SPA drifts.
+3. Port or extend without inventing a different architecture.
+
+Read the matching source file alongside each section. Prefer surgical edits
+that preserve the contracts below.
+
+## Goal
+
+An OpenAI-compatible HTTP API (`/v1/chat/completions`) that answers from a
+**real chatgpt.com web session** via Playwright + Xvfb. It consumes the
+account's **general web chat quota**, not the OpenAI API quota. No API keys.
+
+```
+Client  →  adapter.py :18111  →  gateway.py :18110  →  Chromium (Xvfb :99)  →  chatgpt.com
+         (OpenAI-shaped)         (SPA driver,         (persistent profile)
+                                  single-flight)
+```
+
+**Target:** Ubuntu 22.04+, Python 3.10–3.12, arm64 or x64.  
+If live SPA selectors/timings drift, keep the **behavioral contract** below and
+log what you changed.
 
 ---
 
-## 1. System contract (must match exactly)
+## 0. Non-negotiables
 
-- Two processes, both loopback-bound:
-  - **gateway** on `127.0.0.1:18110` (owns the browser, single-threaded)
-  - **adapter** on `127.0.0.1:18111` (OpenAI-compatible API)
-- One persistent Chromium session (playwright sync API) under Xvfb on
-  display `:99`, launched with `launch_persistent_context` so the browser
-  profile survives restarts (Cloudflare clearance persists).
-- The SPA session is authenticated with cookies injected from a pasted
-  browser session (see §4). The browser must NOT rely on any manual
-  login for normal operation.
-- Single-flight: exactly ONE chat request at a time. The gateway is a
-  single-threaded `http.server.HTTPServer` (playwright sync API is
-  thread-bound; never thread it). The adapter streams from the gateway.
-- No API keys anywhere. Auth = the injected browser session.
+1. **SPA only.** Never `POST` to `backend-api/conversation` with a Bearer token
+   — that gets `403 unusual activity`. Only drive the real web UI.
+2. **One browser, one lock.** Gateway = sync Playwright + single-threaded
+   `http.server.HTTPServer`. Never thread the browser.
+3. **Loopback only.** Bind `127.0.0.1` for ports `18100` / `18110` / `18111`.
+4. **Headful Chromium** under Xvfb (`headless=False`). Headless trips detection.
+5. **Same profile dir across restarts** or Cloudflare re-challenges every boot.
+6. **No secrets in the repo.** Session state lives under `~/.chatgpt-adapter/`.
 
-## 2. Deliverables (files to create)
+---
+
+## 1. Repo layout (already present)
+
+Flat package — open these files; do not regenerate them:
 
 | File | Role |
 |------|------|
-| `browser.py` | `ChatGPTBrowser` class: launcher + stealth + state snapshot |
-| `gateway.py` | SPA-driving HTTP server (boot, ask, stream, status) |
-| `adapter.py` | FastAPI OpenAI-compatible front (delta protocol, SSE translation) |
-| `session_inject.py` | Cookie-paste -> profile injection -> session harvest |
-| `login.py` | Optional manual-login control daemon (port 18100) |
-| `run_gateway.sh` / `run_adapter.sh` | Service launchers (Xvfb check + exec venv python) |
-| `requirements.txt` | playwright, playwright-stealth, fastapi, uvicorn, httpx |
+| `browser.py` | `ChatGPTBrowser`: persistent Chromium + stealth + `save_state` |
+| `gateway.py` | SPA driver HTTP server (`/status`, `/chat`, `/chat/stream`) |
+| `adapter.py` | FastAPI OpenAI front + **delta protocol** |
+| `session_inject.py` | Paste cookie header → profile + `cookies_parsed.json` |
+| `login.py` | Optional login control daemon (`:18100`) |
+| `run_gateway.sh` | Ensure Xvfb `:99`, then `gateway.py 18110` |
+| `run_adapter.sh` | `uvicorn adapter:app --host 127.0.0.1 --port 18111` |
+| `requirements.txt` | Pins below |
+| `.gitignore` | Ignore session artifacts (see §8) |
+| `LICENSE` | MIT |
+| `README.md` | Human install/API docs |
+| `AGENT_BUILD.md` | This contract |
 
-Package layout: `browser.py` lives next to the adapter/gateway; runtime
-state goes in `~/.chatgpt-adapter/` (profile dir, state.json, chmod 600).
+Only create a file if it is actually missing from the tree.
 
----
+### `requirements.txt`
 
-## 3. Browser layer (`browser.py`)
+```
+fastapi==0.103.2
+uvicorn==0.23.2
+httpx==0.28.1
+playwright==1.61.0
+playwright-stealth==2.0.3
+```
 
-**Launch** (key parameters):
-- `chromium.launch_persistent_context(user_data_dir=~/.chatgpt-adapter/profile,
-  headless=False, viewport 1280x800, locale en-US, timezone Asia/Kolkata)`
-- Launch args: `--no-sandbox --disable-gpu --use-angle=swiftshader
-  --disable-dev-shm-usage --disable-blink-features=AutomationControlled
-  --window-size=1280,900`
-- Stealth init script on the page:
-  - `navigator.webdriver` -> undefined
-  - `navigator.languages` -> `['en-US','en']`
-  - plugins array spoofed, `window.chrome = {runtime:{}}`
-- Also apply `playwright_stealth.Stealth().apply_stealth_sync(page)` if
-  importable (wrap in try/except).
-
-**State snapshot** (`save_state`): write → `state.json` (chmod 600) with
-`saved_at`, `url`, `localStorage` (json), `cookies` (all chatgpt.com
-cookies). Screen dump helper → `latest.png`. `localStorage()` helper reads
-all localStorage as JSON (used to find the Bearer token key).
-
-**Hard rules:**
-- Never use headless=True with this SPA; the automation detection trips.
-- Keep the SAME profile dir across restarts, or Cloudflare re-challenges.
-- Pre-warm with `goto("https://www.google.com/")` before any protected
-  navigation (please treat as a session-warming heuristic).
+Setup (once per machine): `python3 -m venv .venv`,  
+`pip install -r requirements.txt`, `python -m playwright install chromium`.  
+System package: `xvfb` (+ `xdpyinfo`).
 
 ---
 
-## 4. Cookie/session contract
+## 2. Runtime paths & env
 
-The machine cannot complete the OpenAI password login (device/proof
-checks). Session setup = paste the user's logged-in browser cookies:
+Default home: `~/.chatgpt-adapter/` (`CHATGPT_HOME`).
 
-1. User copies the full `cookie:` header value of any chatgpt.com request
-   from DevTools > Network (after reload, logged in).
-2. They save a JSON: `{"token": "", "cookies": "name=value; n2=v2; ..."}`
-3. `session_inject.py`:
-   - parse the `;`-separated pairs
-   - for each: `add_cookies` with domain candidates
-     `[".chatgpt.com", "chatgpt.com", ".openai.com", ".auth.openai.com"]`,
-     `secure=True` for names starting `__Secure` or `_dd_s`; secure=False
-     otherwise; `sameSite Lax`, path `/`.
-   - navigate to chatgpt.com, wait out any "Just a moment" interstitial
-     (up to 4 min, sleeping BEFORE reading page.title, title-based check
-     `just a moment not in title`), settle 8s
-   - harvest storage state (`ctx.storage_state()`) -> `storage_state.json`;
-     probe localStorage keys (`accessToken`, `access_token`, ...) for a
-     bearer; taste logged_in = url contains chatgpt.com and body text does
-     not start with "log in"
-4. The cookie map the gateway boot reads lives at `/tmp/cookies_parsed.json`:
-   an array of `{name, value}` pairs.
-   - Secure-required cookie names: `__Secure-next-auth.session-token.0/1
-     __Secure-oai-is __Secure-next-auth.callback-url
-     __Host-next-auth.csrf-token cf_clearance __cf_bm _cfuvid`
-   - Host-only cookie names (domain = `chatgpt.com` only):
-     `__Host-next-auth.csrf-token __Secure-next-auth.callback-url`
-   - Everything else: set on `.chatgpt.com`, `chatgpt.com`, `.openai.com`,
-     `.auth.openai.com` (attempt all four; ignore exceptions).
+| Path | Writer | Reader | Purpose |
+|------|--------|--------|---------|
+| `$CHATGPT_HOME/profile/` | Playwright | Playwright | Persistent Chromium profile (CF clearance) |
+| `$CHATGPT_HOME/cookies_parsed.json` | `session_inject.py` | `gateway.py` boot | `[[name, value], ...]` cookie map |
+| `$CHATGPT_HOME/state.json` | `browser.save_state` | ops | Token/cookie snapshot (chmod `600`) |
+| `$CHATGPT_HOME/storage_state.json` | `session_inject.py` | ops | Playwright `storage_state()` dump |
+| `$CHATGPT_HOME/session_info.json` | `session_inject.py` | ops | Login probe |
+| `$CHATGPT_HOME/latest.png` | `browser.shot` / login | ops | Screenshot |
 
-**Gateway boot sequence** (after cookie injection):
-1. `page.goto("https://chatgpt.com/", wait_until domcontentloaded, 120s)`
-2. CF wait loop: up to 420s, poll every 15s; break when
-   `just a moment`/`security` not in `page.title()` and title non-empty.
-   (Sleep BEFORE reading title.)
-3. Settle 8s; close any welcome modal: `[data-testid="close-button"]`
-   first, fallback `button:has-text('Close')`, click only if visible.
-4. Mark `ready`. Serve requests.
+**Env vars:**
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `CHATGPT_HOME` | `~/.chatgpt-adapter` | Runtime state root |
+| `CHATGPT_COOKIE_FILE` | (resolved) | Override cookie map path |
+| `CHATGPT_TZ` | `Asia/Kolkata` | Chromium `timezone_id` |
+| `CHATGPT_GATEWAY` | `http://127.0.0.1:18110` | Adapter → gateway URL |
+| `DISPLAY` | `:99` | Set by browser/scripts |
+
+**Cookie file resolution in gateway** (first hit wins):
+
+1. `CHATGPT_COOKIE_FILE` if set  
+2. `$CHATGPT_HOME/cookies_parsed.json` if it exists  
+3. Legacy `/tmp/cookies_parsed.json` if it exists  
+4. Else `$CHATGPT_HOME/cookies_parsed.json` (expected path; boot fails if missing)
 
 ---
 
-## 5. Gateway (`gateway.py`) - behavioral contract
+## 3. `browser.py`
 
-HTTP API (all JSON):
-- `GET /status` → `{"ok": bool, "title": str, "error": null|str, "turns": int}`
-  where turns = current assistant-message count in the live thread
-  (`document.querySelectorAll('[data-message-author-role="assistant"]').length`).
-- `POST /chat` → body `{"prompt": str, "model": str?, "reset": bool?}` →
-  200 `{"text": str}` or 500 `{"error": str}`. Non-streaming (drain generator).
-- `POST /chat/stream` → same body → SSE stream of
-  `{"delta": str, "text": str}` events and a final `{"done": true, "text": str}`.
-  Errors as `{"error": str}` events.
-- Anything else → 404 `{"error": "not found"}`. Bad JSON → 400.
-  Not booted → 503 with the boot error.
+```python
+BASE = expanduser(CHATGPT_HOME or "~/.chatgpt-adapter")
+PROFILE = BASE/profile
+STATE = BASE/state.json
+TIMEZONE = CHATGPT_TZ or "Asia/Kolkata"
+```
 
-### one ask (the whole point): `ask_stream(page, prompt, model?, reset?)`
+**`ChatGPTBrowser.start()`:**
 
-1. Global `threading.Lock` acquired for the entire turn (single-flight).
-2. `reset=True`: click `[data-testid="create-new-chat-button"]` (try, 6s,
-   swallow errors, sleep 0.8s).
-3. Count `turns0` = assistant messages currently in the DOM.
-4. Focus composer: click `#prompt-textarea` (30s timeout). If missing →
-   yield `{"error": ...}`.
-5. INSERT the prompt with:
-   `document.execCommand('insertText', false, txt)` on the focused
-   `#prompt-textarea` (instant for large prompts). Verify it actually
-   inserted (execCommand returned truthy OR element innerText non-empty).
-   Fallback: `page.keyboard.type(prompt, delay=15)`.
-6. sleep 0.3s, `page.keyboard.press("Enter")`.
-7. Poll every 0.25s for up to 480s:
-   - Read ALL assistant messages as JSON string → parse
-     (`document.querySelectorAll('[data-message-author-role="assistant"]')`
-     mapped to innerText).
-   - If count > turns0: current = arr[turns0]; if != last → emit
-     `{"delta": growth, "text": current}`; reset idle on growth.
-   - Completion when ALL: turns > turns0 AND stop button
-     (`[data-testid="stop-button"]`) not visible (offsetParent null) AND
-     send button not disabled AND idle >= 3 polls. Stop-button/send-button
-     checked via one JS evaluate returning JSON.
-   - Idle cap 45 (give up, emit what we have).
+- `sync_playwright().start()`
+- `chromium.launch_persistent_context(user_data_dir=PROFILE, headless=False,
+  viewport={1280,800}, locale="en-US", timezone_id=TIMEZONE, args=LAUNCH_ARGS)`
+- Launch args exactly:
+  `--no-sandbox --disable-gpu --use-angle=swiftshader --disable-dev-shm-usage
+  --disable-blink-features=AutomationControlled --window-size=1280,900`
+- Init script stealth: `navigator.webdriver` undefined; `languages=['en-US','en']`;
+  fake `plugins`; `window.chrome={runtime:{}}`
+- Also try `playwright_stealth.Stealth().apply_stealth_sync(page)` (try/except)
+- Reuse `context.pages[0]` or `new_page()`
+
+**Helpers:** `shot()` → `$BASE/latest.png` (fix: use `BASE`, not an undefined name);  
+`localStorage()` → JSON of all keys;  
+`save_state()` → write `state.json` chmod `600` with `saved_at`, `url`,
+`localStorage`, `cookies` for `https://chatgpt.com`.
+
+**Hard rules:** never `headless=True`; keep the same profile; warm with
+`goto("https://www.google.com/")` before protected navigations.
+
+---
+
+## 4. Session inject (`session_inject.py`)
+
+Password login from a datacenter IP usually fails device/proof checks. Normal
+path = paste cookies from a logged-in real browser.
+
+**Input file JSON:**
+
+```json
+{"token": "", "cookies": "name=value; name2=value2; ..."}
+```
+
+User source: DevTools → Network → any chatgpt.com request → copy full
+`cookie:` request header value into that JSON.
+
+**`session_inject.py` must:**
+
+1. Parse `;`-separated cookies → `{name: value}`.
+2. Write `$CHATGPT_HOME/cookies_parsed.json` as `[[name, value], ...]` (chmod `600`).
+   **This file is required for gateway boot** — do not skip it.
+3. Start `ChatGPTBrowser`, `add_cookies` for each cookie × domains
+   `[".chatgpt.com", "chatgpt.com", ".openai.com", ".auth.openai.com"]`,
+   `secure=True` if name contains `__Secure` or is `_dd_s`, else `False`;
+   `sameSite="Lax"`, `path="/"`. Ignore per-domain failures.
+4. Warm `google.com` → `chatgpt.com`; wait out CF interstitial up to ~4 min
+   (sleep **before** reading `page.title()`; break when title lacks
+   `just a moment` / `security verification`).
+5. Settle ~8s; harvest:
+   - `storage_state.json` from `ctx.storage_state()`
+   - `session_info.json` with url/title/token probe
+     (`localStorage` keys `accessToken`, `access_token`, `token`, `auth_token`)
+     and `logged_in` = url has `chatgpt.com` and body does not start with "log in"
+6. `b.stop()`.
+
+**Usage:**
+
+```bash
+Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &
+DISPLAY=:99 .venv/bin/python session_inject.py /path/to/cookies.json
+```
+
+---
+
+## 5. Gateway (`gateway.py`) — contract
+
+Print `COOKIE_FILE <path>` then boot; on success print `GATEWAY_UP <port>`.
+
+### Boot
+
+1. Load cookie pairs from resolved cookie file.
+2. `ChatGPTBrowser().start()`; keep browser/page on `_state`.
+3. For each `[name, value]`:
+   - `secure` if name in  
+     `{__Secure-next-auth.session-token.0, __Secure-next-auth.session-token.1,
+       __Secure-oai-is, __Secure-next-auth.callback-url, __Host-next-auth.csrf-token,
+       cf_clearance, __cf_bm, _cfuvid}`
+   - domains: `["chatgpt.com"]` only if name in  
+     `{__Host-next-auth.csrf-token, __Secure-next-auth.callback-url}`;  
+     else all four chatgpt/openai domains. Ignore add failures.
+4. `page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)`
+5. CF wait ≤420s, sleep **15s before each title read**; break when title nonempty
+   and lacks `just a moment` / `security`.
+6. Settle 8s; close welcome modal if visible:
+   `[data-testid="close-button"]` then `button:has-text('Close')`.
+7. `_state["ok"]=True`. Serve forever on `127.0.0.1:18110`.
+
+### HTTP API
+
+| Method | Path | Behavior |
+|--------|------|----------|
+| GET | `/status` | `{"ok", "title", "error", "turns"}` — `turns` = assistant message count in DOM |
+| POST | `/chat` | Body `{"prompt","model?","reset?"}` → drain stream → `{"text"}` or 500 `{"error"}` |
+| POST | `/chat/stream` | Same body → SSE `data: {json}\n\n` events |
+| * | else | 404; bad JSON 400; not booted 503 |
+
+SSE events: `{"delta","text"}` growth, final `{"done": true, "text": ...}`,
+or `{"error": "..."}`.
+
+### `ask_stream(page, prompt, model=None, reset=False)` — the core
+
+1. Acquire global `threading.Lock` for the whole turn.
+2. If `reset`: click `[data-testid="create-new-chat-button"]` (6s, swallow errors, sleep 0.8s).
+3. `turns0` = count of `[data-message-author-role="assistant"]`.
+4. Click `#prompt-textarea` (30s). Missing → yield error.
+5. Insert via `document.execCommand('insertText', false, txt)` on `#prompt-textarea`.
+   Must verify insert succeeded; fallback `page.keyboard.type(prompt, delay=15)`.
+6. Sleep 0.3s; `keyboard.press("Enter")`.
+7. Poll every 0.25s for ≤480s:
+   - Read all assistant `innerText`s as JSON array.
+   - If `len > turns0`: take `arr[turns0]`; on growth emit
+     `{"delta": growth, "text": current}` (growth = suffix if prefix-stable).
+   - Done when: turns > turns0 AND stop button
+     (`[data-testid="stop-button"]`) not visible (`offsetParent` null) AND
+     send button not disabled AND idle ≥ 3 polls.
+   - Idle cap 45 → emit what you have.
 8. Yield `{"done": true, "text": last}`.
 
-Native context: one `ChatGPTBrowser` per process, booted once in `main()`,
-then a forever `serve_forever`. Boot errors captured in a `_state["error"]`
-so /status and request paths can report 503.
-
-## 6. Adapter (`adapter.py`) — OpenAI-compatible front
-
-FastAPI app on 127.0.0.1:18111.
-
-- `GET /v1/models` → `{"object":"list","data":[{"id":"gpt-5.6-luna",...}]}`
-  (mirror the current chatgpt.com model label; it drifts. Old labels like
-  gpt-5.5/gpt-5 don't exist anymore; SPA decides the actual model.)
-- `GET /health` → `{"ok": true, "gateway": <status_json>}`.
-- `POST /v1/chat/completions`:
-  - body: OpenAI messages, optional `stream`
-  - **Prompt build**: system messages become `[system] {content}` lines;
-    others become `[{role}] {content}`; join with `\n` into one string.
-  - **Delta protocol (MUST)**: keep global `_prev_prompt`.
-    - `_prev_prompt is not None` AND `prompt.startswith(_prev_prompt)` AND
-      longer → send ONLY `prompt[len(_prev_prompt):]` to the gateway with
-      `"reset": false` (continue same thread, server-side context cache).
-    - else → send FULL prompt with `"reset": true` (new conversation).
-    - Store `_prev_prompt = prompt` after every request.
-  - Stream backend: `httpx.stream("POST", gateway/chat/stream, json=body,
-    timeout=600)`; parse `data:` SSE lines into dicts; first event doubles
-    as the health check of the gateway (raise → 502).
-  - stream=true → OpenAI `chat.completion.chunk` SSE (`delta`,
-    `finish_reason:"stop"` on done, final `data: [DONE]`).
-  - stream=false → buffer deltas into one `chat.completion` object,
-    `usage: null` (SPA doesn't report usage).
-  - Gateway errors → OpenAI-style `{"error":{"message":..., "type":
-    "backend_error"}}` with 502.
-
-### 7. Services / deployment
-
-- `run_gateway.sh`: check Xvfb :99 (`xdpyinfo -display :99`); if down,
-  start `Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &`; then
-  `exec .venv/bin/python gateway.py 18110`.
-- `run_adapter.sh`: `exec .venv/bin/python -m uvicorn adapter:app
-  --host 127.0.0.1 --port 18111`.
-- PM2 note (Ubuntu with PM2 6.0.14): a bun-fork bug breaks launching venv
-  console scripts directly; ALWAYS go through the `.sh` wrappers with
-  `exec`. `pm2 save` after starting; enable pm2-ubuntu.service.
-- Auto-start Xvfb at boot if not present.
+Non-stream `ask` = drain the generator.
 
 ---
 
-## 8. Acceptance tests (run these, in order)
+## 6. Adapter (`adapter.py`) — OpenAI front
 
-1. `curl -s http://127.0.0.1:18110/status` → ok true, title "ChatGPT"
-2. `curl -s http://127.0.0.1:18111/v1/models` → list with gpt-5.6-luna
-3. `curl -s http://127.0.0.1:18111/health` → ok + gateway ok
-4. Completion: `curl -s 127.0.0.1:18111/v1/chat/completions -H
-   Content-Type:application/json -d '{"model":"gpt-5.6-luna",
-   "messages":[{"role":"user","content":"Reply exactly: PONG"}]}'`
-   → 200, content "pong" (approx, case-insensitive), `finish_reason
-   : "stop"` within 60s.
-5. Thread-reuse: after test 4, `/status` turns == 1; then send a second
-   tiny prompt "and now X from ABOVE" (a plain extension of the first in
-   the SAME conversation); turns should become 2, confirming the same
-   thread continued (no reset). On a brand-new request that diverges
-   (full new conversation), turns should grow again or a new thread.
-6. Streaming: same call with `"stream": true`; expect chunk SSE events
-   and `data: [DONE]`.
-7. Restart test: kill both PM2 processes, `pm2 restart chatgpt-gateway
-   chatgpt-adapter`, status recovers, reuse still works (same profile).
+FastAPI app title `chatgpt-web-adapter`. Gateway URL from `CHATGPT_GATEWAY`.
 
-## 9. Constraints / anti-patterns
+| Route | Response |
+|-------|----------|
+| `GET /v1/models` | `{"object":"list","data":[{"id":"gpt-5.6-luna","object":"model","owned_by":"openai"}]}` — keep id in sync with SPA label |
+| `GET /health` | `{"ok": true, "gateway": <status json>}` |
+| `POST /v1/chat/completions` | OpenAI chat completion (stream or not) |
 
-- NEVER send raw Bearer POSTs to `backend-api/conversation` - immutable IP
-  faces 403 "unusual activity" even with a valid token; only the SPA flow
-  passes device/proof checks.
-- NEVER thread the gateway. One `HTTPServer` with one handler, one lock.
-- NEVER read `page.title()` before sleeping in the CF loop (racy).
-- Don't guess model names; the SPA defaults to whatever current label
-  chatgpt.com uses, `/v1/models` mirrors it.
-- Two clients → each request diverges → each gets its own chat; that's
-  accepted (constructor).
-- Sessions expire silently; flow is re-inject cookie and restart (the
-  gateway reads /tmp/cookies_parsed.json at boot only).
+### Prompt build
 
-## 10. Precedent (build-time notes)
+For each message:
 
-- Original measured: turn1 ~20.2s, reused-thread turn ~15.9s; the delta
-  gets you meaningful wins with ~30k context.
-- SPA auto-new-chat near context limit: `turns0` logic keeps capturing the
-  newest assistant turn; optionally force a pool point by sending
-  `"reset": true`.
-- All service ports (18100 login, 18110 gateway, 18111 adapter) are
-  loopback-bound only; keep them that way.
+- `system` → `[system] {content}`
+- else → `[{role}] {content}`
+
+Join with `\n`.
+
+### Delta protocol (required)
+
+Keep global `_prev_prompt`.
+
+- If `_prev_prompt` is set AND `prompt.startswith(_prev_prompt)` AND longer  
+  → gateway body `{"prompt": prompt[len(_prev_prompt):], "model", "reset": false}`
+- Else → `{"prompt": prompt, "model", "reset": true}`
+- Always set `_prev_prompt = prompt` after deciding.
+
+This is what makes multi-turn agent clients cheap: the SPA keeps the thread and
+caches the large prefix server-side.
+
+### Streaming translation
+
+- Backend: `httpx.stream POST {GATEWAY}/chat/stream`, timeout 600; parse `data:` lines.
+- First event failure → 502 OpenAI-style `{"error":{"message","type":"backend_error"}}`.
+- `stream=true` → OpenAI `chat.completion.chunk` SSE; `finish_reason:"stop"` on done; end with `data: [DONE]`.
+- `stream=false` → one `chat.completion` with `usage: null`.
+
+---
+
+## 7. `login.py` (optional)
+
+Control daemon on `127.0.0.1:18100` for assisted password login when cookies
+cannot be pasted. Import `ChatGPTBrowser` from **this package dir** (not a
+hardcoded absolute path). Screenshots → `$CHATGPT_HOME/latest.png`.
+
+On start: warm google → open
+`https://chatgpt.com/auth/login?screen_hint=password`.  
+Print `LOGIN_DAEMON_READY ...`.
+
+`POST /ctrl` JSON `{"op": ...}` ops: `goto`, `shot`, `eval`, `click`, `fill`,
+`press`, `ck`, `waitclear`, `waitts`, `netlog`, `current`, `save`.  
+Prefer cookie inject for production; this is a fallback.
+
+---
+
+## 8. Launchers, ignore, license
+
+**`run_gateway.sh`:**
+
+```bash
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+if ! xdpyinfo -display :99 >/dev/null 2>&1; then
+  Xvfb :99 -screen 0 1280x900x24 -nolisten tcp >/tmp/xvfb99.log 2>&1 &
+  sleep 2
+fi
+exec .venv/bin/python gateway.py 18110
+```
+
+**`run_adapter.sh`:**
+
+```bash
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+exec .venv/bin/python -m uvicorn adapter:app --host 127.0.0.1 --port 18111
+```
+
+PM2 (esp. 6.x): always start the `.sh` wrappers (`exec`), not venv console
+scripts directly. Example:
+
+```bash
+pm2 start run_gateway.sh --name chatgpt-gateway
+pm2 start run_adapter.sh --name chatgpt-adapter
+pm2 save
+```
+
+**`.gitignore` must ignore:** `__pycache__/`, `*.pyc`, `.venv/`, `state.json`,
+`storage_state.json`, `session_info.json`, `cookies_parsed.json`, `latest.png`,
+`pasted_session.json`, `.DS_Store`.
+
+**License:** MIT.
+
+---
+
+## 9. Bring-up order (run existing code)
+
+Do not rewrite sources for a normal bring-up. From the repo root:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+
+# 1) inject session (writes cookies_parsed.json + profile)
+DISPLAY=:99 .venv/bin/python session_inject.py ./cookies.json
+
+# 2) gateway first, then adapter
+.venv/bin/python gateway.py 18110
+.venv/bin/python -m uvicorn adapter:app --host 127.0.0.1 --port 18111
+```
+
+Or: `pm2 start run_gateway.sh` / `run_adapter.sh` as in the README.
+
+---
+
+## 10. Acceptance tests (pass in order)
+
+1. `GET :18110/status` → `ok: true`, `title` contains `ChatGPT`
+2. `GET :18111/v1/models` → includes `gpt-5.6-luna` (or current SPA label)
+3. `GET :18111/health` → `ok` and gateway ok
+4. Non-stream completion: messages `[{"role":"user","content":"Reply exactly: PONG"}]`  
+   → content ≈ `pong`, `finish_reason: stop`, within ~60s
+5. Thread reuse: after (4), `/status` `turns == 1`. Send a **prefix-extending**
+   second turn (same conversation growth). `turns` becomes `2` (no reset).
+   A diverging full prompt starts a new chat (`reset: true`).
+6. `stream: true` → chunk SSE + `data: [DONE]`
+7. Restart both processes; `/status` recovers using the **same** profile dir
+
+---
+
+## 11. Anti-patterns (do not do)
+
+- Raw API/Bearer conversation calls
+- Threading Playwright / multi-worker gateway
+- Reading `page.title()` before sleeping in CF loops
+- Guessing model ids ahead of the SPA
+- Committing cookies, `state.json`, profile, or screenshots
+- Binding services on `0.0.0.0`
+- Skipping `cookies_parsed.json` write in `session_inject.py`
+- Hardcoding machine paths like `/home/ubuntu/...`
+
+---
+
+## 12. Expected performance notes
+
+- Cold turn ~20s; reused-thread follow-up ~16s (grows more valuable with large context).
+- Near context limit the SPA may auto-new-chat; `turns0` still captures the new
+  assistant bubble; force reset with `reset: true` / diverging prompt when needed.
+- One request at a time by design. Two interleaved clients each get resets.
+
+---
+
+## Done when
+
+Your change preserves §0–§6 contracts, §10 tests still pass (or you documented
+SPA-driven selector updates), no secrets landed in git, and ports stay
+loopback-only. Prefer editing the existing modules over adding parallel
+implementations.

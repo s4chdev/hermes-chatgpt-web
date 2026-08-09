@@ -4,7 +4,7 @@
 Serves /v1/models, /v1/chat/completions (SSE + non-stream) on localhost.
 Backend: the SPA gateway (gateway.py) which drives the real chatgpt.com UI
 with the injected browser session, so OpenAI's device/proof checks pass and the
-GENERAL chat subscription quota is consumed (not codex).
+GENERAL chat subscription quota is consumed (not the API quota).
 """
 import json
 import os
@@ -19,10 +19,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 GATEWAY = os.environ.get("CHATGPT_GATEWAY", "http://127.0.0.1:18110")
 
 # Full prompt sent for the previous turn. When the next full prompt starts with
-# this prefix (Hermes always replays the whole conversation), only the delta is
-# sent and the SAME chatgpt.com thread is continued, so the ~30k context prefix
-# stays cached server-side. Any divergence triggers a fresh chat with the full
-# prompt.
+# this prefix (common for agents that replay the whole conversation each turn),
+# only the delta is sent and the SAME chatgpt.com thread is continued, so the
+# large context prefix stays cached server-side. Any divergence triggers a fresh
+# chat with the full prompt.
 _prev_prompt = None
 
 app = FastAPI(title="chatgpt-web-adapter")
@@ -107,7 +107,7 @@ async def chat_completions(request: Request):
     prompt = "\n".join(user_parts)
 
     # Delta protocol: reuse the live thread when the full conversation is just
-    # a prefix of what we sent before (normal Hermes turn growth). Only the
+    # a prefix of what we sent before (normal agent turn growth). Only the
     # appended text goes to the gateway, with reset=False so the SAME chatgpt.com
     # conversation continues and the big context prefix is served from cache.
     # On any divergence (new session, changed system prompt, cache cold start)

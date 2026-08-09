@@ -9,10 +9,11 @@ not the API quota.
 No OpenAI API key needed. Works with any OpenAI-compatible client:
 curl, OpenAI SDKs, agent frameworks, or your own scripts.
 
-> Use responsibly: this consumes your own account's web chat quota in a
-> way OpenAI's web UI doesn't expect (automation). Rates at human-like
-> levels, one request at a time, and keep your account session secure.
-> Not for resale or high-frequency abuse.
+> **Disclaimer:** Not affiliated with OpenAI. Automating chatgpt.com may
+> violate OpenAI's Terms of Use and can risk account restriction. Use only on
+> accounts you own, at human-like rates, one request at a time. Keep your
+> session cookies private. Not for resale or high-frequency abuse. Provided
+> as-is under the MIT License with no warranty.
 
 ## How it works
 
@@ -35,7 +36,7 @@ browser.py   (stealth Chromium, logged into chatgpt.com)
 chatgpt.com web UI  (real composer, real conversation thread)
 ```
 
-- **Gateway**: a persistent headless Chrome session holds your login. For
+- **Gateway**: a persistent headful Chrome session holds your login. For
   each request it types into the composer, presses Enter, and scrapes the
   new assistant message, streaming text growth as deltas.
 - **Adapter**: translates that into a standard
@@ -52,6 +53,20 @@ chatgpt.com web UI  (real composer, real conversation thread)
 | `session_inject.py` | Refresh tool: paste a `cookie:` header from your browser and it re-logs this machine's profile |
 | `login.py` | Optional manual-login control daemon for password-based sign-in |
 
+### Runtime paths (defaults)
+
+| Path | Role |
+|------|------|
+| `~/.chatgpt-adapter/profile/` | Persistent Chromium profile (Cloudflare clearance survives restarts) |
+| `~/.chatgpt-adapter/cookies_parsed.json` | `[[name, value], ...]` cookie map loaded by the gateway at boot |
+| `~/.chatgpt-adapter/state.json` | Token/cookie snapshot from `save_state` |
+| `~/.chatgpt-adapter/storage_state.json` | Playwright storage state from `session_inject.py` |
+| `~/.chatgpt-adapter/session_info.json` | Login probe output from `session_inject.py` |
+
+Override with `CHATGPT_HOME`, `CHATGPT_COOKIE_FILE`, `CHATGPT_TZ`, or
+`CHATGPT_GATEWAY`. The gateway also accepts a legacy `/tmp/cookies_parsed.json`
+if the home path is missing (original deployment layout).
+
 ---
 
 ## Quick start
@@ -60,7 +75,7 @@ Prereqs: Python 3.10+, Playwright Chromium, Xvfb (Linux), and a ChatGPT
 account with a working web session (any plan with web chat).
 
 ```bash
-git clone <this-repo> chatgpt-web-adapter
+git clone https://github.com/<you>/chatgpt-web-adapter.git
 cd chatgpt-web-adapter
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -76,7 +91,8 @@ save a JSON file:
 {"token": "", "cookies": "__Secure-next-auth.session-token.0=...; ..."}
 ```
 
-Then inject it into the VM's Chrome profile:
+Then inject it into the machine's Chrome profile (this also writes
+`~/.chatgpt-adapter/cookies_parsed.json` for the gateway):
 
 ```bash
 Xvfb :99 -screen 0 1280x800x24 &
@@ -176,7 +192,7 @@ startup script ensures Xvfb :99 is up first.
 | "log in" content in the page | Session expired; re-inject cookies with `session_inject.py`. |
 | Cloudflare interstitial loop | Keep the same profile dir; first-run can take a few minutes; don't read `page.title()` before sleeping, or it races. |
 | Slow first reply | First turn after boot is cold; subsequent reused-thread turns are faster. |
-| Stale/garbled replies | The SPA auto-started a new chat at max context; send `"restart"`-style reset (delta protocol) to pool the conversation. |
+| Stale/garbled replies | The SPA auto-started a new chat at max context; send a diverging prompt (delta protocol) to force a fresh conversation. |
 
 ## Limitations
 
@@ -187,3 +203,13 @@ startup script ensures Xvfb :99 is up first.
 - Model name is whatever chatgpt.com currently ships; mirror the SPA labels.
 - Requires a valid web session cookie; sessions expire and must be
   re-injected periodically.
+
+## For agents
+
+Use **[AGENT_BUILD.md](AGENT_BUILD.md)** — behavioral contract for the
+**existing** code (do not recreate the tree). Covers selectors, delta
+protocol, paths, and acceptance tests for verify/fix/extend work.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -2,7 +2,7 @@
 
 Holds a persistent headful Chromium (under Xvfb) logged into chatgpt.com,
 and gives the adapter a live web-scoped token + browser cookie context so
-backend-api/conversation calls look like the real web app (no codex).
+backend-api/conversation calls look like the real web app.
 """
 import json
 import os
@@ -10,10 +10,15 @@ import time
 
 from playwright.sync_api import sync_playwright
 
-BASE = os.path.expanduser("~/.chatgpt-adapter")
+# Runtime state lives under ~/.chatgpt-adapter by default (override with CHATGPT_HOME).
+BASE = os.path.expanduser(os.environ.get("CHATGPT_HOME", "~/.chatgpt-adapter"))
 PROFILE = os.path.join(BASE, "profile")  # persistent Chromium profile dir
 STATE = os.path.join(BASE, "state.json")  # harvested token/cookies snapshot
 os.makedirs(PROFILE, exist_ok=True)
+
+# Match the timezone of the machine that owns the ChatGPT session when possible.
+# Override with CHATGPT_TZ (IANA name). Default matches the original deployment.
+TIMEZONE = os.environ.get("CHATGPT_TZ", "Asia/Kolkata")
 
 LAUNCH_ARGS = [
     "--no-sandbox",
@@ -49,7 +54,7 @@ class ChatGPTBrowser:
             args=LAUNCH_ARGS,
             viewport={"width": 1280, "height": 800},
             locale="en-US",
-            timezone_id="Asia/Kolkata",
+            timezone_id=TIMEZONE,
         )
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         if self.stealth:
@@ -62,7 +67,7 @@ class ChatGPTBrowser:
         return self
 
     def shot(self, path=None):
-        path = path or f"{BASE_DIR}/latest.png"
+        path = path or os.path.join(BASE, "latest.png")
         self.page.screenshot(path=path)
         return path
 

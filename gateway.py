@@ -19,7 +19,25 @@ from browser import ChatGPTBrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-COOKIE_FILE = "/tmp/cookies_parsed.json"
+
+
+def _default_cookie_file():
+    """Resolve cookie map path. Prefer CHATGPT_COOKIE_FILE, then ~/.chatgpt-adapter,
+    then the legacy /tmp path used by the original deployment."""
+    env = os.environ.get("CHATGPT_COOKIE_FILE")
+    if env:
+        return env
+    home = os.path.expanduser(os.environ.get("CHATGPT_HOME", "~/.chatgpt-adapter"))
+    candidate = os.path.join(home, "cookies_parsed.json")
+    if os.path.exists(candidate):
+        return candidate
+    legacy = "/tmp/cookies_parsed.json"
+    if os.path.exists(legacy):
+        return legacy
+    return candidate
+
+
+COOKIE_FILE = _default_cookie_file()
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18110
 
 SECURE = {"__Secure-next-auth.session-token.0", "__Secure-next-auth.session-token.1",
@@ -277,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    print(f"COOKIE_FILE {COOKIE_FILE}", flush=True)
     boot()
     srv = HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"GATEWAY_UP {PORT}", flush=True)

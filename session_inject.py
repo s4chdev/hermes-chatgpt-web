@@ -3,20 +3,24 @@
 
 Usage: DISPLAY=:99 ./.venv/bin/python session_inject.py <cookies_json_file>
 Reads the JSON {token, cookies} pasted from the user's browser, loads cookies into
-the profile context, navigates to chatgpt.com, lets the session settle, then dumps:
-- storage_state.json (cookies + auth headers for the adapter)
-- session_info.json (token, logged-in status, page URL)
+the profile context, navigates to chatgpt.com, lets the session settle, then dumps
+under ~/.chatgpt-adapter/ (override with CHATGPT_HOME):
+- cookies_parsed.json  ([[name, value], ...] — what gateway.py reads at boot)
+- storage_state.json   (Playwright storage state)
+- session_info.json    (token / logged-in probe)
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
-from browser import ChatGPTBrowser
+from browser import BASE, ChatGPTBrowser
 
-PROFILE = Path.home() / ".chatgpt-adapter" / "profile"
-OUT_STATE = Path.home() / "chatgpt-adapter" / "storage_state.json"
-OUT_INFO = Path.home() / "chatgpt-adapter" / "session_info.json"
+OUT_DIR = Path(BASE)
+OUT_COOKIES = OUT_DIR / "cookies_parsed.json"
+OUT_STATE = OUT_DIR / "storage_state.json"
+OUT_INFO = OUT_DIR / "session_info.json"
 
 
 def parse_cookie_line(raw: str) -> dict:
@@ -35,8 +39,18 @@ def parse_cookie_line(raw: str) -> dict:
 def main():
     src = Path(sys.argv[1]).read_text().strip()
     payload = json.loads(src)  # {"token": ..., "cookies": "k=v; ..."}
-    tok = payload.get("token")
     cookies = parse_cookie_line(payload.get("cookies", ""))
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Persist the [[name, value], ...] map the gateway loads at boot.
+    pairs = [[name, value] for name, value in cookies.items()]
+    OUT_COOKIES.write_text(json.dumps(pairs))
+    try:
+        os.chmod(OUT_COOKIES, 0o600)
+    except OSError:
+        pass
+    print(f"cookies map -> {OUT_COOKIES} ({len(pairs)} cookies)")
 
     # Split cookies by likely domain. chatgpt.com primary; openai.com secondary.
     # Domain heuristics: oai-* and __Secure-* → .chatgpt.com; auth/account ids → place both.
@@ -118,6 +132,11 @@ def main():
     state = ctx.storage_state()
     OUT_STATE.write_text(json.dumps(state, indent=2))
     OUT_INFO.write_text(json.dumps(info, indent=2))
+    try:
+        os.chmod(OUT_STATE, 0o600)
+        os.chmod(OUT_INFO, 0o600)
+    except OSError:
+        pass
     print(f"storage state -> {OUT_STATE}")
     print(f"info -> {OUT_INFO}")
     print(json.dumps({k: (v if k != "body_head" else (v[:120] + "…" if isinstance(v, str) else v)) for k, v in info.items()}, indent=2))

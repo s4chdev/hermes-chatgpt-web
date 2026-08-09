@@ -7,8 +7,8 @@ __pycache__/
 state.json
 storage_state.json
 session_info.json
+cookies_parsed.json
 latest.png
-/tmp/cookies_parsed.json
 pasted_session.json
 
 # OS

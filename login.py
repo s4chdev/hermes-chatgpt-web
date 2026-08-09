@@ -23,10 +23,12 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-sys.path.insert(0, "/home/ubuntu/chatgpt-adapter")
-from browser import ChatGPTBrowser
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from browser import BASE, ChatGPTBrowser
 
-SHOT_DIR = "/home/ubuntu/chatgpt-adapter"
+SHOT_DIR = BASE
+os.makedirs(SHOT_DIR, exist_ok=True)
 browser = ChatGPTBrowser(stealth=True)
 browser.start()
 NETLOG = []
