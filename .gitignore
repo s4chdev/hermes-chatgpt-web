@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Session state - NEVER commit live browser sessions or cookies
+state.json
+storage_state.json
+session_info.json
+latest.png
+/tmp/cookies_parsed.json
+pasted_session.json
+
+# OS
+.DS_Store

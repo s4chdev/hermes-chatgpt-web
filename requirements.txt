@@ -1,0 +1,5 @@
+fastapi==0.103.2
+uvicorn==0.23.2
+httpx==0.28.1
+playwright==1.61.0
+playwright-stealth==2.0.3
