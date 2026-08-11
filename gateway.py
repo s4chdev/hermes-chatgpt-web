@@ -124,8 +124,20 @@ def ask_stream(page, prompt, model=None, reset=False):
         except Exception:
             turns0 = 0
         try:
+            # clear any overlay/dialog that may be intercepting pointer events, then focus composer
+            page.evaluate("""() => {
+                for (const b of [...document.querySelectorAll('[role="dialog"] button, [data-testid="close-button"], button[aria-label*="close" i]')]) {
+                    if (b.offsetParent !== null) { try { b.click(); } catch (e) {} }
+                }
+                const el = document.querySelector('#prompt-textarea');
+                if (el) { el.scrollIntoView({block: 'center'}); el.focus(); }
+            }""")
+            time.sleep(1.2)
             ta = page.locator("#prompt-textarea").first
-            ta.click(timeout=30000)
+            try:
+                ta.click(timeout=8000)
+            except Exception:
+                page.evaluate("() => { const el = document.querySelector('#prompt-textarea'); if (el) el.click(); }")
         except Exception as e:
             yield {"error": f"composer not found: {str(e)[:200]}"}
             return
@@ -237,6 +249,30 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 turns = None
             self._send(200, {"ok": _state["ok"], "title": _state["title"], "error": _state["error"], "turns": turns})
+        elif self.path.startswith("/debug"):
+            try:
+                js = """(() => {
+                    const ta = document.querySelector('#prompt-textarea');
+                    const r = ta ? ta.getBoundingClientRect() : null;
+                    const cx = r ? Math.round(r.left + r.width/2) : Math.round(innerWidth/2);
+                    const cy = r ? Math.round(r.top + r.height/2) : Math.round(innerHeight/2);
+                    const at = document.elementFromPoint(cx, cy);
+                    const dialogs = [...document.querySelectorAll('[role="dialog"], [data-testid*="modal" i], [data-testid*="Modal"]')]
+                        .filter(d => d.offsetParent !== null).map(d => (d.outerHTML || '').slice(0, 150));
+                    const toasts = [...document.querySelectorAll('[role="alert"]')].map(t => (t.innerText || '').slice(0, 120));
+                    return JSON.stringify({
+                        title: document.title,
+                        taPresent: !!ta,
+                        taRect: r ? {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), vw: innerWidth, vh: innerHeight} : null,
+                        atCenter: at ? at.tagName + '|' + (at.className || '').toString().slice(0, 100) : null,
+                        dialogs: dialogs.slice(0, 5), toasts: toasts.slice(0, 5),
+                        body: (document.body.innerText || '').slice(0, 250)
+                    });
+                })()"""
+                info = _state["page"].evaluate(js)
+                self._send(200, {"ok": _state["ok"], "info": json.loads(info or "{}")})
+            except Exception as e:
+                self._send(200, {"ok": _state["ok"], "debug_error": str(e)[:300]})
         else:
             self._send(404, {"error": "not found"})
 
