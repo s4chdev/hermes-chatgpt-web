@@ -40,6 +40,36 @@ def _gw_status():
         return {"ok": False, "error": str(e)[:150]}
 
 
+def _heal_gateway(max_wait=300):
+    """If the gateway is wedged (busy with no SPA activity for >120s) or
+    unreachable, restart it under PM2 and wait for a fresh boot.
+    Returns True if a restart was issued and the gateway came back ok."""
+    try:
+        st = _gw_status()
+        if st.get("ok"):
+            wedged = st.get("busy") and (st.get("idle_s") or 0) > 120
+            if not wedged:
+                return False  # healthy or app-level error, restart would not help
+    except Exception:
+        pass  # unreachable: restart warranted
+    try:
+        import subprocess
+        subprocess.run(["pm2", "restart", "chatgpt-gateway", "--update-env"],
+                       timeout=20, capture_output=True)
+    except Exception:
+        return False
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            st = _gw_status()
+            if st.get("ok"):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _gw_chat_stream(body: dict):
     """Yield gateway SSE events (dicts) for one chat turn."""
     with httpx.stream("POST", f"{GATEWAY}/chat/stream",
@@ -120,13 +150,23 @@ async def chat_completions(request: Request):
     _prev_prompt = prompt
 
     # gateway is single-flight; stream from the SPA, proxied as SSE
+    def _open():
+        it = _gw_chat_stream(body)
+        return it, next(it)  # raises on gateway/HTTP errors
+
     try:
-        gw_iter = _gw_chat_stream(body)
-        first = next(gw_iter)  # raises on gateway/HTTP errors
+        gw_iter, first = _open()
     except StopIteration:
         return JSONResponse({"error": {"message": "gateway returned no events", "type": "backend_error"}}, status_code=502)
     except Exception as e:
-        return JSONResponse({"error": {"message": f"gateway error: {e}", "type": "backend_error"}}, status_code=502)
+        err = str(e)[:300]
+        if _heal_gateway():
+            try:
+                gw_iter, first = _open()
+            except Exception as e2:
+                first = {"error": f"gateway error after auto-restart: {str(e2)[:200]}"}
+        else:
+            first = {"error": f"gateway error: {err}"}
 
     if first.get("error"):
         return JSONResponse({"error": {"message": first["error"], "type": "backend_error"}}, status_code=502)

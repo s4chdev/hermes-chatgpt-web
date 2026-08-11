@@ -40,12 +40,20 @@ def _default_cookie_file():
 COOKIE_FILE = _default_cookie_file()
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18110
 
+# If a request is busy but no poll has succeeded for this long, the SPA page is
+# wedged inside Playwright: the watchdog thread exits the process so PM2 can
+# restart it cleanly. Only ever READ from the watchdog (thread-safe); all
+# Playwright calls stay in the main thread.
+WATCHDOG_TIMEOUT = 240
+
 SECURE = {"__Secure-next-auth.session-token.0", "__Secure-next-auth.session-token.1",
           "__Secure-oai-is", "__Secure-next-auth.callback-url", "__Host-next-auth.csrf-token",
           "cf_clearance", "__cf_bm", "_cfuvid"}
 HOST_ONLY = {"__Host-next-auth.csrf-token", "__Secure-next-auth.callback-url"}
 
-_state = {"ready": False, "error": None, "title": "", "lock": threading.Lock()}
+_state = {"ready": False, "error": None, "title": "", "busy": False,
+          "busy_since": None, "last_activity": 0.0, "turns": 0,
+          "lock": threading.Lock()}
 
 
 def boot():
@@ -90,6 +98,12 @@ def boot():
     except Exception:
         pass
     _state["ok"] = True
+    _state["last_activity"] = time.time()
+    try:
+        _state["turns"] = page.evaluate(
+            "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
+    except Exception:
+        _state["turns"] = 0
 
 
 def new_chat(page):
@@ -115,15 +129,27 @@ def ask_stream(page, prompt, model=None, reset=False):
     """
     model = model or "auto"
     with _state["lock"]:
+        _state["busy"] = True
+        _state["busy_since"] = time.time()
+        _state["last_activity"] = time.time()
+        try:
+            yield from _ask_locked(page, prompt, model, reset)
+        finally:
+            _state["busy"] = False
+            _state["busy_since"] = None
+
+
+def _ask_locked(page, prompt, model, reset):
+    if reset:
+        new_chat(page)
+    # count pre-existing assistant turns so we only emit NEW message text
+    try:
+        turns0 = page.evaluate(
+            "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
+    except Exception:
+        turns0 = 0
+    try:
         if reset:
-            new_chat(page)
-        # count pre-existing assistant turns so we only emit NEW message text
-        try:
-            turns0 = page.evaluate(
-                "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
-        except Exception:
-            turns0 = 0
-        try:
             # clear any overlay/dialog that may be intercepting pointer events, then focus composer
             page.evaluate("""() => {
                 for (const b of [...document.querySelectorAll('[role="dialog"] button, [data-testid="close-button"], button[aria-label*="close" i]')]) {
@@ -132,83 +158,91 @@ def ask_stream(page, prompt, model=None, reset=False):
                 const el = document.querySelector('#prompt-textarea');
                 if (el) { el.scrollIntoView({block: 'center'}); el.focus(); }
             }""")
-            time.sleep(1.2)
-            ta = page.locator("#prompt-textarea").first
-            try:
-                ta.click(timeout=8000)
-            except Exception:
-                page.evaluate("() => { const el = document.querySelector('#prompt-textarea'); if (el) el.click(); }")
-        except Exception as e:
-            yield {"error": f"composer not found: {str(e)[:200]}"}
-            return
-        # insert via execCommand: instant regardless of prompt size
+            time.sleep(0.4)
+        ta = page.locator("#prompt-textarea").first
         try:
-            inserted = page.evaluate("""(txt) => {
-                const el = document.querySelector('#prompt-textarea');
-                if (!el) return false;
-                el.focus();
-                const ok = document.execCommand('insertText', false, txt);
-                return ok === true || el.innerText.trim().length > 0;
-            }""", prompt)
-            if not inserted:
-                raise RuntimeError("insertText returned falsy")
+            ta.click(timeout=8000)
         except Exception:
-            try:
-                page.keyboard.type(prompt, delay=15)
-            except Exception:
-                yield {"error": "prompt insert failed"}
-                return
-        time.sleep(0.3)
+            page.evaluate("() => { const el = document.querySelector('#prompt-textarea'); if (el) el.click(); }")
+    except Exception as e:
+        yield {"error": f"composer not found: {str(e)[:200]}"}
+        return
+    # insert via execCommand: instant regardless of prompt size
+    try:
+        inserted = page.evaluate("""(txt) => {
+            const el = document.querySelector('#prompt-textarea');
+            if (!el) return false;
+            el.focus();
+            const ok = document.execCommand('insertText', false, txt);
+            return ok === true || el.innerText.trim().length > 0;
+        }""", prompt)
+        if not inserted:
+            raise RuntimeError("insertText returned falsy")
+    except Exception:
         try:
-            page.keyboard.press("Enter")
+            page.keyboard.type(prompt, delay=15)
         except Exception:
-            yield {"error": "send failed"}
+            yield {"error": "prompt insert failed"}
             return
-        # fast poll loop: emit text growth as deltas, detect completion
-        t0 = time.time()
-        last = ""
-        idle = 0
-        while time.time() - t0 < 480:
-            time.sleep(0.25)
-            try:
-                msgs = page.evaluate(
-                    """JSON.stringify([...document.querySelectorAll('[data-message-author-role="assistant"]')]
-                        .map(el => el.innerText))""")
-                arr = json.loads(msgs or "[]")
-                if len(arr) > turns0:
-                    cur = arr[turns0]
-                    if cur != last:
-                        if cur.startswith(last) and last:
-                            delta = cur[len(last):]
-                        else:
-                            delta = cur
-                        last = cur
-                        idle = 0
-                        if delta:
-                            yield {"delta": delta, "text": cur}
-                    elif cur:
-                        idle += 1
-            except Exception:
-                pass
-            # completion: new turn arrived, generator button gone, composer re-enabled, text stable
-            try:
-                done = page.evaluate(
-                    """(() => {
-                        const spb = document.querySelector('[data-testid="stop-button"]');
-                        const gen = spb && spb.offsetParent !== null;
-                        const sbtn = document.querySelector('[data-testid="send-button"], button[type="submit"]');
-                        const dis = sbtn ? sbtn.disabled : null;
-                        const turns = document.querySelectorAll('[data-message-author-role="assistant"]').length;
-                        return JSON.stringify({gen, dis, turns});
-                    })()""")
-                s = json.loads(done or "{}")
-                if s.get("turns", 0) > turns0 and not s.get("gen", True) and s.get("dis", False) is False and idle >= 3:
-                    break
-            except Exception:
-                pass
-            if idle > 45:
-                break
-        yield {"done": True, "text": last}
+    time.sleep(0.3)
+    try:
+        page.keyboard.press("Enter")
+    except Exception:
+        yield {"error": "send failed"}
+        return
+    # fast poll loop: ONE combined evaluate per tick, reading ONLY the last
+    # assistant message (the old code serialized every message's innerText in
+    # two separate evaluates each tick; expensive on long threads).
+    t0 = time.time()
+    last = ""
+    idle = 0
+    s = {}
+    while time.time() - t0 < 480:
+        time.sleep(0.25)
+        try:
+            _state["last_activity"] = time.time()
+            snap = page.evaluate(
+                """JSON.stringify((() => {
+                    const els = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+                    const spb = document.querySelector('[data-testid="stop-button"]');
+                    const sbtn = document.querySelector('[data-testid="send-button"], button[type="submit"]');
+                    return {
+                        cur: els.length ? els[els.length - 1].innerText : '',
+                        turns: els.length,
+                        gen: !!(spb && spb.offsetParent !== null),
+                        sbtn_ok: !!(sbtn && !sbtn.disabled)
+                    };
+                })())""")
+            s = json.loads(snap or "{}")
+        except Exception:
+            continue
+        _state["last_activity"] = time.time()
+        if s.get("turns", 0) > turns0:
+            _state["turns"] = s["turns"]
+        cur = s.get("cur", "")
+        if cur != last:
+            if cur.startswith(last) and last:
+                delta = cur[len(last):]
+            else:
+                delta = cur
+            last = cur
+            idle = 0
+            if delta:
+                yield {"delta": delta, "text": cur}
+            continue
+        idle += 1
+        # completion: a NEW turn exists, generation finished (stop button
+        # gone), text stable ~1s. Old code required a triple condition that
+        # never aligned, so it always fell through to the 11s idle backstop.
+        new_turn = s.get("turns", 0) > turns0
+        if new_turn and not s.get("gen") and s.get("sbtn_ok") and idle >= 4:
+            break
+        if new_turn and not s.get("gen") and idle >= 12:
+            break
+        if idle > 60:
+            break
+    _state["turns"] = s.get("turns", _state["turns"])
+    yield {"done": True, "text": last}
 
 
 def ask(page, prompt, model=None, reset=False):
@@ -243,12 +277,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/status"):
-            try:
-                turns = _state["page"].evaluate(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length")
-            except Exception:
-                turns = None
-            self._send(200, {"ok": _state["ok"], "title": _state["title"], "error": _state["error"], "turns": turns})
+            now = time.time()
+            # NEVER touches Playwright: must answer even while a request holds
+            # the page (single-threaded server). Wedged = busy + idle_s growing.
+            self._send(200, {
+                "ok": _state["ok"], "title": _state["title"], "error": _state["error"],
+                "turns": _state["turns"], "busy": _state["busy"],
+                "busy_since": _state["busy_since"],
+                "last_activity": _state["last_activity"],
+                "idle_s": round(now - _state["last_activity"], 1) if _state["last_activity"] else None,
+            })
         elif self.path.startswith("/debug"):
             try:
                 js = """(() => {
@@ -331,8 +369,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"COOKIE_FILE {COOKIE_FILE}", flush=True)
     boot()
+
+    def _watchdog():
+        while True:
+            time.sleep(10)
+            if _state["busy"] and time.time() - _state["last_activity"] > WATCHDOG_TIMEOUT:
+                print("GATEWAY_WEDGED watchdog exit, PM2 will restart", flush=True)
+                os._exit(1)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+    print(f"COOKIE_FILE {COOKIE_FILE}", flush=True)
     srv = HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"GATEWAY_UP {PORT}", flush=True)
     srv.serve_forever()
